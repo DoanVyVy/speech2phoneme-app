@@ -3,6 +3,7 @@ import numpy as np
 import Levenshtein
 import re
 from model_utils import transcribe, convert_to_ipa
+from phoneme_extractor import phoneme_extractor, extract_phonemes
 import librosa
 
 class PronunciationEvaluator:
@@ -119,12 +120,16 @@ class PronunciationEvaluator:
         Returns:
             Dict chứa kết quả đánh giá
         """
-        # Lấy phiên âm của người dùng
-        user_result = transcribe(audio_path, output_ipa=True)
-        user_text = user_result["raw"]
-        user_ipa = user_result["ipa"]
+        # NEW METHOD: Lấy phiên âm trực tiếp từ âm thanh (không qua văn bản)
+        user_phonemes = extract_phonemes(audio_path)
+        user_text = transcribe(audio_path, output_ipa=False)  # Vẫn lấy văn bản để hiển thị
+        user_ipa_direct = user_phonemes["ipa"]  # Phiên âm IPA trực tiếp từ âm thanh
         
-        # Lấy phát âm chuẩn
+        # Lưu cả phiên âm gián tiếp (qua văn bản) để so sánh với phương pháp cũ
+        user_result = transcribe(audio_path, output_ipa=True)
+        user_ipa_indirect = user_result["ipa"]  # Phiên âm IPA gián tiếp qua văn bản
+        
+        # Lấy phát âm chuẩn (ground truth)
         reference_ipa = self.get_standard_pronunciation(reference_text)
         
         # Tính điểm độ chính xác văn bản (ASR accuracy)
@@ -132,10 +137,23 @@ class PronunciationEvaluator:
         text_max_len = max(len(reference_text), len(user_text))
         text_accuracy = ((text_max_len - text_distance) / text_max_len) * 100 if text_max_len > 0 else 100
         
-        # Tính điểm độ chính xác phát âm (Pronunciation accuracy)
-        ipa_distance = self.weighted_levenshtein_distance(reference_ipa, user_ipa)
-        ipa_max_len = max(len(reference_ipa), len(user_ipa))
-        pronunciation_accuracy = ((ipa_max_len - ipa_distance) / ipa_max_len) * 100 if ipa_max_len > 0 else 100
+        # Tính điểm độ chính xác phiên âm trực tiếp (Direct Phoneme accuracy)
+        direct_ipa_distance = self.weighted_levenshtein_distance(reference_ipa, user_ipa_direct)
+        direct_ipa_max_len = max(len(reference_ipa), len(user_ipa_direct))
+        direct_pronunciation_accuracy = ((direct_ipa_max_len - direct_ipa_distance) / direct_ipa_max_len) * 100 if direct_ipa_max_len > 0 else 100
+        
+        # Tính điểm độ chính xác phiên âm gián tiếp (qua văn bản) cho tham chiếu
+        indirect_ipa_distance = self.weighted_levenshtein_distance(reference_ipa, user_ipa_indirect)
+        indirect_ipa_max_len = max(len(reference_ipa), len(user_ipa_indirect))
+        indirect_pronunciation_accuracy = ((indirect_ipa_max_len - indirect_ipa_distance) / indirect_ipa_max_len) * 100 if indirect_ipa_max_len > 0 else 100
+        
+        # So sánh độ chính xác giữa hai phương pháp phiên âm
+        print(f"🔍 Độ chính xác phiên âm trực tiếp: {direct_pronunciation_accuracy:.2f}%")
+        print(f"🔍 Độ chính xác phiên âm gián tiếp: {indirect_pronunciation_accuracy:.2f}%")
+        
+        # Sử dụng phương pháp có độ chính xác cao hơn để đánh giá
+        pronunciation_accuracy = max(direct_pronunciation_accuracy, indirect_pronunciation_accuracy)
+        user_ipa = user_ipa_direct if direct_pronunciation_accuracy >= indirect_pronunciation_accuracy else user_ipa_indirect
         
         # Phân tích nhịp điệu và trọng âm
         rhythm_analysis = self.analyze_rhythm_and_stress(audio_path, reference_text)
@@ -159,14 +177,20 @@ class PronunciationEvaluator:
         # Tìm lỗi cụ thể bằng cách so sánh từng từ
         errors = self.identify_specific_errors(reference_text, user_text, reference_ipa, user_ipa)
         
+        # Phân tích phiên âm trực tiếp
+        phoneme_comparison = phoneme_extractor.compare_phonemes(reference_ipa, user_ipa_direct)
+        
         return {
             "score": round(total_score, 2),
             "level": level,
             "details": {
                 "pronunciation_accuracy": round(pronunciation_accuracy, 2),
+                "direct_pronunciation_accuracy": round(direct_pronunciation_accuracy, 2),
+                "indirect_pronunciation_accuracy": round(indirect_pronunciation_accuracy, 2),
                 "text_accuracy": round(text_accuracy, 2),
                 "rhythm_score": round(rhythm_score, 2),
                 "tempo": round(rhythm_analysis["tempo"], 2),
+                "phoneme_similarity": phoneme_comparison["similarity"]
             },
             "reference": {
                 "text": reference_text,
@@ -174,9 +198,13 @@ class PronunciationEvaluator:
             },
             "user": {
                 "text": user_text,
-                "ipa": user_ipa
+                "ipa": user_ipa,
+                "direct_ipa": user_ipa_direct,
+                "indirect_ipa": user_ipa_indirect,
+                "raw_phonemes": user_phonemes["raw_phonemes"]
             },
-            "errors": errors
+            "errors": errors,
+            "method": "direct" if direct_pronunciation_accuracy >= indirect_pronunciation_accuracy else "indirect"
         }
     
     def identify_specific_errors(self, ref_text, user_text, ref_ipa, user_ipa):
