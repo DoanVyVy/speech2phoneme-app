@@ -1,118 +1,145 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-print("🔧 Bắt đầu app.py...")
-
-from model_utils import transcribe
-from pronunciation_evaluator import evaluate_pronunciation
-
-print("✅ Đã import xong model_utils và pronunciation_evaluator")
-
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+import torch
+import torchaudio
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+from g2p_en import G2p
+import tempfile
+import nltk
 import os
-import traceback
-from werkzeug.utils import secure_filename
+import numpy as np
+import librosa
+import re
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend integration
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Ensure nltk resources
+nltk.download('averaged_perceptron_tagger', quiet=True)
 
-# Add root route to help with debugging
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "message": "Speech to Phoneme API is running. Use POST /upload to transcribe audio.",
-        "features": ["Raw phoneme output", "IPA phoneme conversion", "Pronunciation evaluation"]
-    })
+app = FastAPI()
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    try:
-        if "audio" not in request.files:
-            return jsonify({"error": "No audio file provided"}), 400
+# Load Wav2Vec2 phoneme model
+MODEL_NAME = "excalibur12/wav2vec2-large-lv60_phoneme-timit_english_timit-4k"
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
+model.eval()
 
-        file = request.files["audio"]
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
+g2p = G2p()
 
-        # Secure the filename to prevent directory traversal attacks
-        filename = secure_filename(file.filename)
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        
-        print(f"🎤 Saving audio file to {path}")
-        file.save(path)
+# ARPAbet to TIMIT phoneme mapping
+ARPABET_TO_TIMIT = {
+    'AA':'aa','AE':'ae','AH':'ah','AH0':'ax','AO':'ao','AW':'aw','AY':'ay','B':'b','CH':'ch',
+    'D':'d','DH':'dh','EH':'eh','ER':'er','EY':'ey','F':'f','G':'g','HH':'hh','IH':'ih','IY':'iy',
+    'JH':'jh','K':'k','L':'l','M':'m','N':'n','NG':'ng','OW':'ow','OY':'oy','P':'p','R':'r',
+    'S':'s','SH':'sh','T':'t','TH':'th','UH':'uh','UW':'uw','V':'v','W':'w','Y':'y','Z':'z',
+    'ZH':'zh'
+}
 
-        # Check if IPA output is requested (default is True)
-        output_ipa = request.form.get('output_ipa', 'true').lower() == 'true'
+# Variant normalizations (map alternative phones)
+VARIANT_MAP = {'ix':'ih', 'ux':'uw'}
 
-        # Process the audio file
-        print(f"🔍 Transcribing audio file...")
-        result = transcribe(path, output_ipa=output_ipa)
-        
-        response = {
-            "status": "success",
-            "filename": filename
-        }
-        
-        # Nếu kết quả là dictionary (chứa cả raw và ipa)
-        if isinstance(result, dict):
-            response["raw_phonemes"] = result["raw"]
-            response["ipa_phonemes"] = result["ipa"]
+# Normalize phoneme: lowercase, strip stress digits, apply variant mapping
+def normalize_phoneme(p):
+    p_norm = p.lower().rstrip('0123456789')
+    return VARIANT_MAP.get(p_norm, p_norm)
+
+# Filter phonemes: keep only alphabetic phonemes (no markers or noise)
+def filter_phonemes(seq):
+    return [p for p in seq if re.fullmatch(r'[a-z]+', p)]
+
+# Convert ARPAbet g2p output to normalized TIMIT phonemes
+def map_arpabet_to_timit(phonemes):
+    mapped = [ARPABET_TO_TIMIT.get(p.upper(), p) for p in phonemes]
+    return [normalize_phoneme(p) for p in mapped]
+
+# Text -> phoneme sequence
+def text_to_phonemes(text: str):
+    raw = g2p(text)
+    return [p for p in raw if p.strip() and p != ' ']
+
+# Audio -> phoneme sequence
+def audio_to_phonemes(file_path: str):
+    waveform, sr = torchaudio.load(file_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+    input_values = processor(waveform.squeeze(), sampling_rate=16000, return_tensors="pt").input_values
+    with torch.no_grad():
+        logits = model(input_values).logits
+    preds = torch.argmax(logits, dim=-1)
+    phonemes = processor.batch_decode(preds)[0].split()
+    return [normalize_phoneme(p) for p in phonemes]
+
+# Sequence alignment with Levenshtein DP
+def aligned_comparison(expected, actual):
+    m, n = len(expected), len(actual)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m+1): dp[i][0] = i
+    for j in range(n+1): dp[0][j] = j
+    for i in range(1, m+1):
+        for j in range(1, n+1):
+            cost = 0 if expected[i-1] == actual[j-1] else 1
+            dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
+    i, j = m, n
+    correct, mistakes = [], []
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and expected[i-1] == actual[j-1]:
+            correct.append(expected[i-1])
+            i -= 1
+            j -= 1
         else:
-            response["phonemes"] = result
-            
-        return jsonify(response)
-    except Exception as e:
-        print(f"❌ Error during processing: {str(e)}")
-        traceback.print_exc()
-        return jsonify({
-            "status": "error", 
-            "error": str(e),
-            "trace": traceback.format_exc()
-        }), 500
+            ops = []
+            if i > 0: ops.append((dp[i-1][j] + 1, 'del'))
+            if j > 0: ops.append((dp[i][j-1] + 1, 'ins'))
+            if i > 0 and j > 0: ops.append((dp[i-1][j-1] + 1, 'sub'))
+            cost, op = min(ops, key=lambda x: x[0])
+            if op == 'del':
+                mistakes.append({"type": "missing", "phoneme": expected[i-1], "position": i-1})
+                i -= 1
+            elif op == 'ins':
+                mistakes.append({"type": "extra", "phoneme": actual[j-1], "position": j-1})
+                j -= 1
+            else:
+                mistakes.append({
+                    "type": "substitution",
+                    "expected": expected[i-1],
+                    "actual": actual[j-1],
+                    "position": i-1
+                })
+                i -= 1
+                j -= 1
+    correct.reverse()
+    mistakes.reverse()
+    score = round(len(correct) / len(expected) * 100) if expected else 0
+    return correct, mistakes, score
 
-@app.route("/evaluate", methods=["POST"])
-def evaluate():
-    """
-    Endpoint để đánh giá phát âm của người dùng
-    """
+# Prosody features: pitch mean and energy
+def get_prosody_features(file_path):
+    y, sr = librosa.load(file_path, sr=16000)
+    pitches, _ = librosa.piptrack(y=y, sr=sr)
+    pitch_mean = np.mean(pitches[pitches > 0])
+    energy_mean = np.mean(librosa.feature.rms(y=y))
+    return pitch_mean, energy_mean
+
+@app.post("/analyze/")
+async def analyze_pronunciation(audio: UploadFile = File(...), transcript: str = Form(...)):
+    if not transcript.strip():
+        raise HTTPException(status_code=400, detail="Transcript cannot be empty.")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
     try:
-        if "audio" not in request.files:
-            return jsonify({"error": "No audio file provided"}), 400
-
-        file = request.files["audio"]
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
-            
-        # Kiểm tra văn bản tham chiếu
-        reference_text = request.form.get('reference_text', '')
-        if not reference_text:
-            return jsonify({"error": "Reference text is required"}), 400
-
-        # Lưu file âm thanh
-        filename = secure_filename(file.filename)
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        
-        print(f"🎤 Saving audio file to {path}")
-        file.save(path)
-
-        # Đánh giá phát âm
-        print(f"🔍 Evaluating pronunciation...")
-        evaluation = evaluate_pronunciation(path, reference_text)
-        
-        return jsonify({
-            "status": "success",
-            "filename": filename,
-            "evaluation": evaluation
-        })
-    except Exception as e:
-        print(f"❌ Error during evaluation: {str(e)}")
-        traceback.print_exc()
-        return jsonify({
-            "status": "error", 
-            "error": str(e),
-            "trace": traceback.format_exc()
-        }), 500
-
-if __name__ == "__main__":
-    print("✅ Server đang khởi động...")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+        expected_raw = text_to_phonemes(transcript)
+        expected = filter_phonemes(map_arpabet_to_timit(expected_raw))
+        actual_raw = audio_to_phonemes(tmp_path)
+        actual = filter_phonemes(actual_raw)
+        correct, mistakes, score = aligned_comparison(expected, actual)
+        pitch, energy = get_prosody_features(tmp_path)
+    finally:
+        os.remove(tmp_path)
+    return JSONResponse({
+        "expected_phonemes": expected,
+        "user_phonemes": actual,
+        "correct_phonemes": correct,
+        "mistakes": mistakes,
+        "score": score,
+        "pitch_mean": round(float(pitch), 2),
+        "energy_mean": round(float(energy), 4)
+    })
