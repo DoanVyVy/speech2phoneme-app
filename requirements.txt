@@ -5,3 +5,7 @@ torchaudio
 transformers
 g2p_en
 python-multipart
+nltk
+noisereduce
+librosa
+numpy
